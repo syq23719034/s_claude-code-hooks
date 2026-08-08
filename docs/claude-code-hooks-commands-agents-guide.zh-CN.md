@@ -69,6 +69,18 @@
 
 本仓库的 `/workflows:workflow-changelog` 是一个**协调器 prompt**：它要求当前主 agent 并行调用两次 `Agent` 工具，然后等待、合并报告并执行验证清单。所谓“command 里面定义两个子 agent”并不准确：它只写了两个 `subagent_type` 引用。
 
+#### 能否在 slash command 正文里临时“定义一个外部从未出现过的 agent”？
+
+**不能仅靠写一个新的 `subagent_type` 名称来定义。** 例如在 command 中写“调用 `subagent_type: security-genius`”，但该名称既不是内置 agent，也没有通过 managed settings、`--agents`、`.claude/agents/`、`~/.claude/agents/` 或 plugin 注册，Claude Code 的 agent registry 就无法解析它，调用会失败；command 正文不是 agent definition registry。
+
+有三种容易混淆、但合法的做法：
+
+1. **临时任务提示词，不是临时 agent 类型**：调用已经存在的 `general-purpose` agent，把全新的角色、目标和输出格式放进这一次 `Agent` tool 的 prompt。它可以表现得像临时专家，但其模型、工具和权限仍来自 `general-purpose`，也不能在其他调用中用这个临时角色名寻址。
+2. **先创建，再调用**：command 可以要求主 Claude 先写入 `.claude/agents/security-genius.md`，待 Claude Code 发现并注册后再调用 `security-genius`。这会修改项目配置，不是 command 内联定义；新建首个 `agents` 目录等情况可能需要重启，而且执行 workflow 时动态改配置不如预先提交稳定。
+3. **启动会话时注入**：使用 `claude --agents '{...}'` 传入会话级定义；在 Claude Agent SDK 中则通过 SDK 的 `agents` option 程序化定义。此时 agent 确实不需要存在于仓库文件中，但仍然是在 command 运行前/SDK options 中注册，而不是由 command 正文声明。
+
+本项目的 `claude-code-guide` 正是第一句话中“外部没看到、但 registry 已经存在”的另一种情形：它是 Claude Code 内置 agent，所以 command 可以直接引用。它并不是该 command 临时创造出来的。
+
 ### 3.3 Skill 与 Agent 的真正嵌套
 
 推荐的新写法可以显式让 skill 在子 agent 中运行：
@@ -86,6 +98,16 @@ disable-model-invocation: true
 ```
 
 `context: fork` 建立独立上下文，`agent` 选择 agent 类型；若省略，使用默认通用 agent。反过来，subagent frontmatter 的 `skills:` 是“启动时预加载技能内容”，不是在 agent 内注册另一个 agent。
+
+### 3.4 模型在哪里选择
+
+模型有三层，不能混为一谈：
+
+1. **主会话模型**：通常由启动参数、settings 或交互式 `/model` 决定。`workflow-changelog.md` 没有 `model` 字段，所以 slash command 协调部分继续使用当时的主会话模型。
+2. **自定义 agent 模型**：由 agent frontmatter 的 `model` 决定；可使用 `sonnet`、`opus`、`haiku`、完整 model ID 或 `inherit`。本仓库三个自定义 agent 都显式写了 `model: opus`，所以 `workflow-changelog-agent` 用 Opus；内置 `claude-code-guide` 的模型由 Claude Code 内置定义决定，而不是这个 command 决定。
+3. **Skill 本次 turn 的模型**：新版 Skill frontmatter 也支持可选的 `model`。普通 skill 中它覆盖当前 turn，下一条用户 prompt 恢复 session model；与 `context: fork` 一起使用时，它设置 forked subagent 的模型。旧 command 虽兼容很多 skill frontmatter，但本仓库的 workflow 文件没有声明该字段。
+
+所以“没看到模型选择项”并不是漏掉一个必填配置：`model` 本来就是可选的。缺省时沿用当前会话或所选 agent definition 的规则。若希望 workflow 的研究 agent 使用 Sonnet，应改 `.claude/agents/workflows/workflow-changelog-agent.md` 中的 `model`；若希望协调器整轮换模型，则迁移为 Skill 并在 frontmatter 设置 `model`，或在执行前用 `/model` 选择。
 
 ## 4. Agents 系统与本项目的三个自定义 agent
 
@@ -310,4 +332,3 @@ Agent 文件里的 hooks 是同一协议，但只在该 agent 活跃期间注册
 * [Agent loop](https://code.claude.com/docs/en/agent-sdk/agent-loop)
 * [SDK custom tools / in-process MCP](https://code.claude.com/docs/en/agent-sdk/custom-tools)
 * [SDK hooks](https://code.claude.com/docs/en/agent-sdk/hooks)
-
