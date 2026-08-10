@@ -1,0 +1,49 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/.claude/hooks/templates/standard-hook.py"
+            ],
+            "timeout": 10,
+            "statusMessage": "Validating tool call"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/.claude/hooks/templates/standard-hook.py"
+            ],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/.claude/hooks/templates/standard-hook.py"
+            ],
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
