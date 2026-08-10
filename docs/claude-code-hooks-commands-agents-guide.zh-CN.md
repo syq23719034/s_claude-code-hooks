@@ -332,3 +332,148 @@ Agent 文件里的 hooks 是同一协议，但只在该 agent 活跃期间注册
 * [Agent loop](https://code.claude.com/docs/en/agent-sdk/agent-loop)
 * [SDK custom tools / in-process MCP](https://code.claude.com/docs/en/agent-sdk/custom-tools)
 * [SDK hooks](https://code.claude.com/docs/en/agent-sdk/hooks)
+
+## 12. 最新官方协议下的代码要求与标准模板（2026-08-10 核对）
+
+### 12.1 先纠正“必须包含哪些模块”
+
+Anthropic **没有规定 hook 程序必须使用 Python，也没有规定必须 import 某些模块或继承某个基类**。`type: command` 的契约是进程协议：Claude Code 启动任意可执行命令，把本次事件的 JSON object 写到 stdin；程序用 exit code、stderr，以及可选的 stdout JSON object 回应。你可以使用 Python、Node、Go、Rust、Bash 或任何可执行程序。[官方 Configuration](https://code.claude.com/docs/en/hooks#configuration)定义的是 event → matcher group → handler 三层配置，[Hook input and output](https://code.claude.com/docs/en/hooks#hook-input-and-output)定义的是进程边界。
+
+本仓库提供的 [Python 标准起步模板](../.claude/hooks/templates/standard-hook.py)只使用标准库：
+
+* `json`：读取 stdin 和序列化唯一的 stdout JSON；
+* `sys`：stdin/stdout/stderr 与 exit code；
+* `typing`：只为类型标注，可删除。
+
+这些是模板的工程选择，不是 Anthropic 强制模块。模板对应的可复制配置是 [`settings.example.json`](../.claude/hooks/templates/settings.example.json)。
+
+### 12.2 配置文件的最小和推荐规则
+
+hook 可以放在 project `.claude/settings.json`、local `.claude/settings.local.json`、user `~/.claude/settings.json`、managed settings、plugin `hooks/hooks.json`，或 skill/agent frontmatter。不同 settings scope 的 hook 会合并而不是相互覆盖。项目 hook 会执行本机代码，因此首次使用仍受 workspace trust 与组织策略影响。完整位置表见[官方 Hook locations](https://code.claude.com/docs/en/hooks#hook-locations)。
+
+handler 的唯一公共必填字段是 `type`。不同类型再有各自必填项：
+
+| 类型 | 必填 | 谁执行、怎样返回 |
+|---|---|---|
+| `command` | `type`, `command` | 本地进程；stdin JSON，exit code/stderr/stdout JSON |
+| `http` | `type`, `url` | HTTP POST；2xx body 使用同一 JSON output schema |
+| `mcp_tool` | `type`, `server`, `tool` | 已连接 MCP tool；text content 按 command stdout 解释 |
+| `prompt` | `type`, `prompt` | Claude 单轮判断；Claude Code 自动消费 `{ok, reason}` |
+| `agent` | `type`, `prompt` | 实验性多轮 verifier，能用 Read/Grep/Glob 等工具 |
+
+公共可选字段是 `if`、`timeout`、`statusMessage`、`once`；`command` 另有 `args`、`async`、`asyncRewake`、`shell`。当前官方默认 timeout 通常为 command/http/MCP 600 秒、prompt 30 秒、agent 60 秒，但个别事件有更小预算。具体字段以[Hook handler fields](https://code.claude.com/docs/en/hooks#hook-handler-fields)为准。
+
+推荐使用 **exec form**，即 `command: "python3"` 加 `args: [...]`，避免 shell 再次解析路径和特殊字符。只有需要 pipe、redirect 或 `&&` 时才用 shell form。`matcher` 可省略表示全匹配；它匹配哪个输入字段取决于 event。所有匹配到的 handlers 会并行运行，不保证书写顺序。
+
+### 12.3 Command hook 的 stdout、stderr 与 exit code
+
+必须牢记以下边界：
+
+* exit `0` + 无 stdout：成功，不施加控制。
+* exit `0` + stdout JSON：结构化控制。**stdout 必须只包含一个 JSON object**；普通 log 不要混进去。
+* exit `2`：blocking error；Claude Code 忽略 stdout JSON，使用 stderr 作为理由。阻止效果依事件而异。
+* 其他 exit code：对大多数事件是 non-blocking hook error，原动作继续。
+* stderr 在 exit `0` 时通常只进 debug log，不会自动进入模型上下文。
+
+也就是说，Python 的 `print("debug")` 如果写到 stdout，会破坏 JSON。日志应写 stderr 或文件；真正返回协议 JSON 时用一次 `json.dump(..., sys.stdout)`。官方明确要求“exit-code signaling”和“exit 0 + structured JSON”二选一，见[Exit code output](https://code.claude.com/docs/en/hooks#exit-code-output)与[JSON output](https://code.claude.com/docs/en/hooks#json-output)。
+
+### 12.4 哪些文字给用户，哪些文字给主模型
+
+| 输出 | 接收者/效果 |
+|---|---|
+| `systemMessage` | 显示给用户；不是给 Claude 的 handoff |
+| `stopReason` | `continue:false` 时显示给用户；不显示给 Claude |
+| `hookSpecificOutput.additionalContext` | 作为 system reminder 注入 Claude context，在下一次 model request 可见 |
+| top-level `reason` | 支持 block 的事件中作为反馈；例如 Stop/SubagentStop 可成为继续工作的指令 |
+| exit `2` 的 stderr | 依 event 反馈给 Claude 或用户；不能假设所有事件一致 |
+| 普通 stdout | 只有少数事件把它当 context；生产代码应显式返回 JSON，避免依赖特例 |
+| `updatedToolOutput` | PostToolUse 中替换 Claude 看到的结果，不撤销已经发生的副作用 |
+| `displayContent` | MessageDisplay 只改屏幕显示，不改 transcript，也不改 Claude 所见内容 |
+
+`additionalContext` 是最标准的“返回给主模型的文本”：
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PostToolUse",
+    "additionalContext": "The edited file is generated from src/schema.ts."
+  }
+}
+```
+
+官方建议把它写成环境事实，而不是伪装成高优先级 system command，否则可能触发 prompt-injection 防护。输出字符串上限为 10,000 characters，超限会落盘并用 preview/path 替代。详见[Add context for Claude](https://code.claude.com/docs/en/hooks#add-context-for-claude)。
+
+### 12.5 哪些 hook 能直接调用大模型
+
+最新版内建两条模型路径，不需要你的 Python 自己调用 Anthropic API：
+
+**单轮 `prompt` hook：**
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "Check whether every requested deliverable is complete. $ARGUMENTS",
+            "model": "haiku",
+            "timeout": 30,
+            "continueOnBlock": true
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Claude Code 把 hook input 和 prompt 交给模型，并自动要求 `{ "ok": true }` 或 `{ "ok": false, "reason": "..." }`。`model` 可选，默认 fast model。不同 event 对 `ok:false` 的处理不同，尤其 PermissionRequest/PermissionDenied 不能靠这个布尔结果完成细粒度 deny/retry；应查[Prompt-based hooks](https://code.claude.com/docs/en/hooks#prompt-based-hooks)。
+
+**多轮、可用工具的实验性 `agent` hook：**
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "agent",
+            "prompt": "Inspect the repository and verify required tests passed. $ARGUMENTS",
+            "model": "sonnet",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+它会启动最多约 50 turns 的 verifier，可读文件和搜索代码，最终同样返回 ok/reason。官方仍标记为 experimental，生产安全策略优先 deterministic command hook，详见[Agent-based hooks](https://code.claude.com/docs/en/hooks#agent-based-hooks)。
+
+支持全部五种 handler 的事件目前包括 PreToolUse、PermissionRequest、PostToolUse、PostToolUseFailure、PostToolBatch、UserPromptSubmit、UserPromptExpansion、Stop、SubagentStop、TaskCreated、TaskCompleted、TeammateIdle、PermissionDenied。其余事件的类型支持集更窄；`SessionStart`/`Setup` 仅支持 command 和 MCP-tool。不要把 prompt/agent handler 复制到任意事件。
+
+`mcp_tool` 是另一条无需自写 MCP client 的路径，但 server 必须已经连接；SessionStart/Setup 常早于连接完成。command 程序当然也能自行调用 Anthropic API 或 SDK，但那不属于 hook 协议要求，你要自行承担 API key、timeout、重试、费用、模型输出验证和 prompt injection 风险。
+
+### 12.6 可运行标准模板怎样工作
+
+[`standard-hook.py`](../.claude/hooks/templates/standard-hook.py)展示了推荐骨架：
+
+1. 用 `json.load(sys.stdin)` 读取并验证 object；
+2. 用 `hook_event_name` 做显式 dispatch；
+3. PreToolUse 对 Bash 做确定性检查，deny 时返回带正确 `hookEventName` 的 `permissionDecision`；
+4. PostToolUse 用 `additionalContext` 把事实交给下一次模型调用；
+5. Stop 检查 `stop_hook_active`，避免 continuation 无限递归；
+6. 只在有结构化结果时写一次 stdout JSON；诊断写 stderr；
+7. 未处理事件或允许动作时 exit 0 且不输出。
+
+复制 `settings.example.json` 的三个 groups 到项目 `.claude/settings.json` 即可试用。先用 `claude --debug` 检查输入/解析错误，再用 `/hooks` 确认实际加载来源。模板中的 destructive-command 字符串匹配只是教学示例，不是完整 shell parser；高风险生产策略还应结合 permissions deny rules、sandbox、严格解析和测试。Anthropic 也提供了一个更专门的[官方 Bash command validator reference implementation](https://github.com/anthropics/claude-code/blob/main/examples/hooks/bash_command_validator_example.py)。
+
+### 12.7 同步、异步和安全规则
+
+需要 allow/deny、改写 input/output 或立即注入 context 时，保持同步。`async:true` 只适用于 command hook，而且当前动作不会等待它，因此 `decision`、`permissionDecision`、`continue` 都不能控制已推进的动作；异步完成后的 `additionalContext` 要到下一次 conversation turn 才交给 Claude。`asyncRewake:true` 可在 exit 2 时唤醒 Claude。详见[Run hooks in the background](https://code.claude.com/docs/en/hooks#run-hooks-in-the-background)。
+
+最后，command hook 拥有当前用户的文件系统权限。必须验证不可信 stdin、阻止 path traversal、避开 `.env`/keys/`.git` 等敏感路径、引用 shell 变量时加引号，优先使用绝对路径与 exec form。不要把 hook 当成安全沙箱；官方安全清单见[Security considerations](https://code.claude.com/docs/en/hooks#security-considerations)。
